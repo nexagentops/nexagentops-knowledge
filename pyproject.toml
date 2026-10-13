@@ -1,0 +1,12 @@
+[project]
+name = "nexagentops-knowledge"
+version = "0.1.0"
+description = "Local, rebuildable keyword index for personal knowledge exports"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+nex-knowledge = "nex_knowledge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
