@@ -38,6 +38,16 @@ class Snapshot:
     scope: str
     records: tuple[Document, ...]
     authoritative: bool = False
+    confirm_stale: str | None = None
+
+
+def stale_confirmation_token(snapshot: Snapshot, missing_ids: list[str]) -> str:
+    """Bind a confirmation to the exact source, contents, and stale candidates."""
+    evidence = [snapshot.source, snapshot.scope,
+                sorted((record.source_id, record.content_hash) for record in snapshot.records),
+                sorted(missing_ids)]
+    encoded = json.dumps(evidence, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _text(value: object, field: str) -> str:
@@ -241,6 +251,17 @@ def sync_snapshots(db: Path, snapshots: Iterable[Snapshot]) -> dict[str, int | s
                     (snapshot.source, snapshot.scope, run_id),
                 ).fetchone()[0]
                 if snapshot.authoritative:
+                    missing_active = [row[0] for row in connection.execute(
+                        "SELECT source_id FROM documents WHERE source=? AND scope=? AND status='active' "
+                        "AND (last_seen_run_id IS NULL OR last_seen_run_id<>?) ORDER BY source_id",
+                        (snapshot.source, snapshot.scope, run_id),
+                    )]
+                    if missing_active and snapshot.confirm_stale != stale_confirmation_token(snapshot, missing_active):
+                        token = stale_confirmation_token(snapshot, missing_active)
+                        raise ValueError(
+                            f"authoritative import would mark {len(missing_active)} record(s) stale; "
+                            f"verify completeness and rerun with --confirm-stale {token}"
+                        )
                     local["stale_marked"] = connection.execute(
                         "UPDATE documents SET status='stale' WHERE source=? AND scope=? AND status='active' "
                         "AND (last_seen_run_id IS NULL OR last_seen_run_id<>?)",
@@ -270,21 +291,10 @@ def sync(db: Path, records: Iterable[Document], scanned_sources: Iterable[str] =
 
 
 def search(db: Path, query: str, limit: int = 20) -> list[dict[str, str | None]]:
-    if not db.is_file():
-        raise ValueError(f"index does not exist: {db}")
-    if not 1 <= limit <= 100:
-        raise ValueError("limit must be between 1 and 100")
-    with closing(sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            "SELECT d.source, d.source_id, d.title, d.source_path, d.created_at, d.updated_at, "
-            "d.status, d.first_seen_at, d.last_seen_at, d.last_seen_run_id, "
-            "snippet(document_fts, 1, '[', ']', '…', 18) AS snippet "
-            "FROM document_fts JOIN documents d ON d.id=document_fts.rowid "
-            "WHERE document_fts MATCH ? ORDER BY bm25(document_fts), d.source, d.source_id LIMIT ?",
-            (query, limit),
-        ).fetchall()
-        return [dict(row) for row in rows]
+    """Legacy Python entry point, retaining all-status behavior."""
+    from .search_service import SearchRequest, search_documents
+
+    return search_documents(db, SearchRequest(query=query, limit=limit, status="all"))["results"]
 
 
 def recent_snapshots(db: Path, limit: int = 20) -> list[dict[str, str | int]]:

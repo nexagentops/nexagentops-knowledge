@@ -7,7 +7,8 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .index import Snapshot, conversations, markdown, notes, recent_snapshots, search, sync_snapshots
+from .index import Snapshot, conversations, markdown, notes, recent_snapshots, sync_snapshots
+from .search_service import SearchRequest, search_documents
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -21,17 +22,25 @@ def main(argv: list[str] | None = None) -> int:
     ingest.add_argument("--authoritative-chatgpt-archive", type=Path, action="append", default=[])
     ingest.add_argument("--markdown-dir", type=Path, action="append", default=[])
     ingest.add_argument("--authoritative-markdown-dir", type=Path, action="append", default=[])
+    ingest.add_argument("--confirm-stale", help="token from a previous rejected authoritative import")
     lookup = commands.add_parser("search", help="search the local index")
     lookup.add_argument("--db", type=Path, required=True)
     lookup.add_argument("query")
     lookup.add_argument("--limit", type=int, default=20)
+    lookup.add_argument("--source")
+    lookup.add_argument("--scope")
+    lookup.add_argument("--from-date")
+    lookup.add_argument("--to-date")
+    lookup.add_argument("--status", choices=("active", "stale", "all"), default="active")
     history = commands.add_parser("snapshots", help="inspect recent source snapshots")
     history.add_argument("--db", type=Path, required=True)
     history.add_argument("--limit", type=int, default=20)
     args = parser.parse_args(argv)
     try:
         if args.command == "search":
-            print(json.dumps(search(args.db, args.query, args.limit), ensure_ascii=False, indent=2))
+            request = SearchRequest(args.query, args.limit, args.source, args.scope,
+                                    args.from_date, args.to_date, args.status)
+            print(json.dumps(search_documents(args.db, request), ensure_ascii=False, indent=2))
             return 0
         if args.command == "snapshots":
             print(json.dumps(recent_snapshots(args.db, args.limit), ensure_ascii=False, indent=2))
@@ -53,12 +62,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("Markdown directory overlaps a generated source export")
         snapshots = []
         for path, authoritative in selected_notes:
-            snapshots.append(Snapshot("apple_notes", str(path.resolve()), tuple(notes(path)), authoritative))
+            snapshots.append(Snapshot("apple_notes", str(path.resolve()), tuple(notes(path)),
+                                      authoritative, args.confirm_stale))
         for root, authoritative in selected_archives:
             snapshots.append(Snapshot("chatgpt_archive", str(root.resolve()),
-                                      tuple(conversations(root)), authoritative))
+                                      tuple(conversations(root)), authoritative, args.confirm_stale))
         for root, authoritative in selected_markdown:
-            snapshots.append(Snapshot("markdown", str(root.resolve()), tuple(markdown(root)), authoritative))
+            snapshots.append(Snapshot("markdown", str(root.resolve()), tuple(markdown(root)),
+                                      authoritative, args.confirm_stale))
         print(json.dumps(sync_snapshots(args.db, snapshots), sort_keys=True))
         return 0
     except (OSError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:

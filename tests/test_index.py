@@ -3,12 +3,13 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
 from nex_knowledge.cli import main
-from nex_knowledge.index import Document, Snapshot, conversations, markdown, notes, recent_snapshots, search, sync, sync_snapshots
+from nex_knowledge.index import (Document, Snapshot, conversations, markdown, notes, recent_snapshots,
+                                 search, stale_confirmation_token, sync, sync_snapshots)
 
 
 class IndexTests(unittest.TestCase):
@@ -76,7 +77,7 @@ class IndexTests(unittest.TestCase):
         path.write_text("")
         generated = path.parent / "markdown"
         generated.mkdir()
-        with self.assertRaises(SystemExit) as raised:
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as raised:
             main(["sync", "--db", str(self.db), "--notes-jsonl", str(path),
                   "--markdown-dir", str(generated)])
         self.assertEqual(raised.exception.code, 2)
@@ -98,7 +99,10 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(partial["missing"], 1)
         self.assertEqual(partial["stale_marked"], 0)
         self.assertEqual(next(row for row in search(self.db, "rose"))["status"], "active")
-        authoritative = sync_snapshots(self.db, [snapshot([modified], True)])
+        with self.assertRaisesRegex(ValueError, "verify completeness"):
+            sync_snapshots(self.db, [snapshot([modified], True)])
+        token = stale_confirmation_token(snapshot([modified], True), ["n2"])
+        authoritative = sync_snapshots(self.db, [Snapshot("apple_notes", "notes.jsonl", (modified,), True, token)])
         self.assertEqual(authoritative["missing"], 1)
         self.assertEqual(authoritative["stale_marked"], 1)
         self.assertEqual(next(row for row in search(self.db, "rose"))["status"], "stale")
@@ -133,7 +137,9 @@ class IndexTests(unittest.TestCase):
         second = Document("markdown", "b", "B", "beta", "two/b.md")
         sync_snapshots(self.db, [Snapshot("markdown", "one", (first,), True),
                                  Snapshot("markdown", "two", (second,), True)])
-        result = sync_snapshots(self.db, [Snapshot("markdown", "one", (), True)])
+        pending = Snapshot("markdown", "one", (), True)
+        token = stale_confirmation_token(pending, ["a"])
+        result = sync_snapshots(self.db, [Snapshot("markdown", "one", (), True, token)])
         self.assertEqual(result["stale_marked"], 1)
         self.assertEqual(next(row for row in search(self.db, "beta"))["status"], "active")
 
@@ -182,16 +188,63 @@ class IndexTests(unittest.TestCase):
                                    "--authoritative-notes-jsonl", str(path)]), 0)
         self.assertEqual(json.loads(output.getvalue())["added"], 1)
         path.write_text("")
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as blocked:
+            main(["sync", "--db", str(self.db), "--authoritative-notes-jsonl", str(path)])
+        self.assertEqual(blocked.exception.code, 2)
+        self.assertEqual(next(row for row in search(self.db, "lavender"))["status"], "active")
+        token = stale_confirmation_token(Snapshot("apple_notes", str(path.resolve()), (), True), ["n1"])
         output = StringIO()
         with redirect_stdout(output):
             self.assertEqual(main(["sync", "--db", str(self.db),
-                                   "--authoritative-notes-jsonl", str(path)]), 0)
+                                   "--authoritative-notes-jsonl", str(path),
+                                   "--confirm-stale", token]), 0)
         self.assertEqual(json.loads(output.getvalue())["stale_marked"], 1)
         self.assertEqual(next(row for row in search(self.db, "lavender"))["status"], "stale")
         output = StringIO()
         with redirect_stdout(output):
             self.assertEqual(main(["snapshots", "--db", str(self.db)]), 0)
         self.assertEqual(json.loads(output.getvalue())[0]["missing"], 1)
+
+    def test_incomplete_authoritative_import_cannot_silently_stale_records(self):
+        first = Document("apple_notes", "n1", "First", "original", "notes.jsonl")
+        second = Document("apple_notes", "n2", "Second", "preserved", "notes.jsonl")
+        sync_snapshots(self.db, [Snapshot("apple_notes", "notes.jsonl", (first, second), True)])
+        before_runs = len(recent_snapshots(self.db))
+        altered = Document("apple_notes", "n1", "First", "partial content", "notes.jsonl")
+        incomplete = Snapshot("apple_notes", "notes.jsonl", (altered,), True)
+        with self.assertRaisesRegex(ValueError, "verify completeness"):
+            sync_snapshots(self.db, [incomplete])
+        self.assertEqual(len(recent_snapshots(self.db)), before_runs)
+        self.assertEqual(next(row for row in search(self.db, "preserved"))["status"], "active")
+        self.assertEqual(len(search(self.db, "original")), 1)
+        self.assertEqual(search(self.db, "partial"), [])
+        empty = Snapshot("apple_notes", "notes.jsonl", (), True)
+        with self.assertRaisesRegex(ValueError, "verify completeness"):
+            sync_snapshots(self.db, [empty])
+        self.assertEqual(len(recent_snapshots(self.db)), before_runs)
+
+    def test_stale_confirmation_is_bound_to_exact_snapshot(self):
+        first = Document("markdown", "m1", "First", "one", "one.md")
+        second = Document("markdown", "m2", "Second", "two", "two.md")
+        sync_snapshots(self.db, [Snapshot("markdown", "docs", (first, second), True)])
+        token = stale_confirmation_token(Snapshot("markdown", "docs", (first,), True), ["m2"])
+        changed = Document("markdown", "m1", "First", "different", "one.md")
+        with self.assertRaisesRegex(ValueError, "verify completeness"):
+            sync_snapshots(self.db, [Snapshot("markdown", "docs", (changed,), True, token)])
+        self.assertEqual(next(row for row in search(self.db, "two"))["status"], "active")
+
+    def test_failed_authoritative_parse_preserves_existing_status(self):
+        path = self.root / "notes.jsonl"
+        path.write_text(json.dumps({"id": "n1", "title": "First", "body_text": "safe"}) + "\n")
+        with redirect_stdout(StringIO()):
+            main(["sync", "--db", str(self.db), "--authoritative-notes-jsonl", str(path)])
+        before_runs = len(recent_snapshots(self.db))
+        path.write_text('{"id":"n1","body_text":"safe"}\n{"id":')
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as failed:
+            main(["sync", "--db", str(self.db), "--authoritative-notes-jsonl", str(path)])
+        self.assertEqual(failed.exception.code, 2)
+        self.assertEqual(len(recent_snapshots(self.db)), before_runs)
+        self.assertEqual(next(row for row in search(self.db, "safe"))["status"], "active")
 
 
 if __name__ == "__main__":

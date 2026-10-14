@@ -16,7 +16,7 @@ The unified SQLite database is a disposable projection. Existing JSONL, canonica
 
 1. **Implemented: local keyword search.** Source adapters, a transactional SQLite FTS5 index, incremental hash checks, attribution, timestamps, and a CLI. Synthetic tests cover the three source types, repeat syncs, updates, duplicate IDs, and missing-record preservation.
 2. **Implemented: source snapshots and reconciliation.** Track each committed import run, selected source path, authority flag, counts, first and last seen times, and active/stale status. Missing records become stale only after an explicitly authoritative import of that same path.
-3. **Next: read-only local AI interface.** Provide a small local search service for OpenClaw or a local LLM. Return bounded snippets with stable source IDs and paths. Add optional semantic retrieval only after measuring keyword-search gaps; keep embeddings and model execution local and opt-in.
+3. **Implemented: read-only local search interface.** A model-agnostic Python service and JSON CLI provide bounded FTS5 results with stable document IDs, source attribution, snippets, scores, and exact filters. No HTTP listener, model, or agent is included.
 
 ## Run locally
 
@@ -29,6 +29,8 @@ PYTHONPATH=src python3 -B -m nex_knowledge.cli sync \
   --chatgpt-archive /path/to/chatgpt/archive \
   --markdown-dir /path/to/personal/markdown
 PYTHONPATH=src python3 -B -m nex_knowledge.cli search --db data/knowledge.db 'garden AND plans'
+PYTHONPATH=src python3 -B -m nex_knowledge.cli search --db data/knowledge.db \
+  --source apple_notes --status active --from-date 2024-01-01 --limit 5 'garden'
 PYTHONPATH=src python3 -B -m nex_knowledge.cli snapshots --db data/knowledge.db
 PYTHONPATH=src python3 -B -m unittest discover -s tests
 ```
@@ -52,12 +54,53 @@ PYTHONPATH=src python3 -B -m nex_knowledge.cli sync --db data/knowledge.db \
 
 Use the authoritative flag only after confirming that the selected local input is complete for that path. For Notes, upstream count-drop validation matters. For ChatGPT, authority refers to the **local archive's canonical raw files**, not all conversations that might exist remotely. A temporary sync gap or incomplete upstream capture must remain non-authoritative. A missing record is an observation about one snapshot; it does **not** prove deletion. Authoritative absence changes `status` to `stale` and retains content and searchability. Reimporting the record changes it back to `active`. No default operation physically deletes indexed records.
 
+If an authoritative import would newly mark records stale, the first attempt fails without changing documents or recording the run. It prints a `--confirm-stale` token bound to the exact source path, imported IDs/content, and missing IDs. Check the source's completeness, then rerun the same command with that token only if the absence is expected. A changed input invalidates the token. This prevents a failed or unexpectedly incomplete import from **silently** changing status; a human can still incorrectly confirm an incomplete source, so the token is not proof of upstream completeness. Run one source at a time when confirming a stale transition.
+
 The database adds `scope`, `status`, `first_seen_at`, `last_seen_at`, and `last_seen_run_id` to documents, plus `sync_runs` and `source_snapshots` tables. Existing indexes are upgraded in place. Pre-upgrade rows receive a legacy empty scope and remain active; a subsequent import assigns seen rows to the selected source path. Unseen legacy rows are deliberately not marked stale automatically. If a source ID appears under a different nonlegacy scope, sync fails rather than silently changing ownership. Back up a populated local database before relying on a new version; it is rebuildable from source exports.
 
 This is projection-level incremental sync: upstream Notes export and ChatGPT capture retain their own incremental rules. The index does not infer cross-source duplicates from similar content, and Apple Notes generated fallback IDs can change after edits.
 
-## Proposed commits
+## Read-only search interface
 
-- `feat(knowledge): add local source adapters and incremental FTS5 search`
-- `feat(knowledge): track source snapshots and explicit stale reconciliation`
-- `feat(knowledge): expose bounded read-only local search service`
+`nex_knowledge.search_service.search_documents(db, SearchRequest(...))` owns the structured search contract. The CLI only parses arguments and renders its JSON response. The service opens the existing SQLite database in `mode=ro`, sets `query_only`, and never creates a schema or calls the source adapters. No HTTP service is started. A local consumer can call the Python function or launch `nex-knowledge search` as a subprocess.
+
+An index created before snapshot tracking must be upgraded with an explicit local `sync` before using this search interface. Search itself will report the older schema and will not migrate it.
+
+```python
+from pathlib import Path
+from nex_knowledge.search_service import SearchRequest, search_documents
+
+response = search_documents(
+    Path("data/knowledge.db"),
+    SearchRequest("garden", limit=5, source="apple_notes", status="active",
+                  from_date="2024-01-01", to_date="2024-12-31"),
+)
+```
+
+Filters are exact `source` and `scope` strings, inclusive `YYYY-MM-DD` dates, and `active`, `stale`, or `all` status. Dates use the document's `updated_at` when present, otherwise `created_at`; records without either date do not match a date filter. SQLite normalizes timestamps with offsets for calendar-date comparisons. The default status is `active`. The result limit is 1–100 and the FTS5 query is limited to 512 characters. `score` is negative SQLite `bm25`: higher values rank better within a query, but scores are not calibrated across queries. Ties sort by source and source ID.
+
+Example response with synthetic values:
+
+```json
+{
+  "query": "garden",
+  "filters": {"limit": 5, "source": "apple_notes", "scope": null,
+              "from_date": "2024-01-01", "to_date": "2024-12-31", "status": "active"},
+  "count": 1,
+  "results": [{"document_id": "kd_<stable digest>", "source": "apple_notes",
+               "source_id": "example-note", "scope": "/path/to/notes.jsonl",
+               "title": "Garden", "source_path": "/path/to/notes.jsonl",
+               "created_at": "2024-01-01", "updated_at": "2024-03-01",
+               "status": "active", "snippet": "[garden] plans", "score": 0.000001}]
+}
+```
+
+The response includes no full document body, though snippets, titles, and local paths can reveal private information. Give access only to trusted processes and users with permission to read the local database. The CLI has no authentication boundary of its own. It makes no network or telemetry calls, and there is no ingestion, modification, or deletion endpoint in the search service. Its read-only connection prevents writes through this interface, but it cannot protect a database that another local process can modify. Keep the database outside public repositories and restrict its filesystem permissions.
+
+For a future OpenClaw integration, wrap this function or CLI as a narrowly scoped local search tool with a fixed database path, bounded arguments, and explicit user-granted access. Return the JSON results and source IDs to the calling application; do not give the tool a write-capable database connection or source-file access. No OpenClaw wiring is implemented here.
+
+## Commit history and recommendations
+
+- Existing: `feat(knowledge): add local source adapters and incremental FTS5 search`
+- Recommended for this uncommitted contribution: `feat(knowledge): track source snapshots and explicit stale reconciliation`
+- Recommended for this uncommitted contribution: `feat(knowledge): add read-only filtered search contract and safe stale confirmation`
