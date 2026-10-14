@@ -12,11 +12,12 @@ A local, rebuildable keyword search index for existing personal knowledge export
 
 The unified SQLite database is a disposable projection. Existing JSONL, canonical conversation JSON, and Markdown files remain authoritative. Document identity is `(source, source_id)`; a later sync updates an existing row rather than creating another. The adapters reject duplicate IDs within and across selected inputs. Similar text from distinct source identities remains separate so attribution is not lost.
 
-## First three contributions
+## Implemented contributions
 
 1. **Implemented: local keyword search.** Source adapters, a transactional SQLite FTS5 index, incremental hash checks, attribution, timestamps, and a CLI. Synthetic tests cover the three source types, repeat syncs, updates, duplicate IDs, and missing-record preservation.
 2. **Implemented: source snapshots and reconciliation.** Track each committed import run, selected source path, authority flag, counts, first and last seen times, and active/stale status. Missing records become stale only after an explicitly authoritative import of that same path.
 3. **Implemented: read-only local search interface.** A model-agnostic Python service and JSON CLI provide bounded FTS5 results with stable document IDs, source attribution, snippets, scores, and exact filters. No HTTP listener, model, or agent is included.
+4. **Implemented: trusted local consumer adapter.** A one-shot JSON stdin/stdout command delegates to the existing search service. It accepts one bounded request, returns one structured response, and opens no listener.
 
 ## Run locally
 
@@ -97,10 +98,37 @@ Example response with synthetic values:
 
 The response includes no full document body, though snippets, titles, and local paths can reveal private information. Give access only to trusted processes and users with permission to read the local database. The CLI has no authentication boundary of its own. It makes no network or telemetry calls, and there is no ingestion, modification, or deletion endpoint in the search service. Its read-only connection prevents writes through this interface, but it cannot protect a database that another local process can modify. Keep the database outside public repositories and restrict its filesystem permissions.
 
-For a future OpenClaw integration, wrap this function or CLI as a narrowly scoped local search tool with a fixed database path, bounded arguments, and explicit user-granted access. Return the JSON results and source IDs to the calling application; do not give the tool a write-capable database connection or source-file access. No OpenClaw wiring is implemented here.
+## Trusted local consumer adapter
 
-## Commit history and recommendations
+The adapter is a small transport layer over the same `search_documents` function:
 
-- Existing: `feat(knowledge): add local source adapters and incremental FTS5 search`
-- Recommended for this uncommitted contribution: `feat(knowledge): track source snapshots and explicit stale reconciliation`
-- Recommended for this uncommitted contribution: `feat(knowledge): add read-only filtered search contract and safe stale confirmation`
+```text
+selected local exports → SQLite FTS5 index → search_documents → one-shot JSON adapter → trusted local consumer
+```
+
+After local installation, launch `nex-knowledge-consumer --db /absolute/private/knowledge.db`, or use `PYTHONPATH=src python3 -B -m nex_knowledge.consumer --db /absolute/private/knowledge.db` from this checkout. The database path is a trusted launch argument and must be absolute; it is never accepted from the JSON request. The process reads **one UTF-8 JSON object** of at most 8192 bytes from stdin, writes exactly one JSON line to stdout, and exits. It does not stay running or bind a port. A successful request exits with status 0; a rejected request or unavailable index returns an `error` object and exits with status 2. Standard CLI help is available with `--help`.
+
+```sh
+printf '%s\n' '{"query":"garden","limit":3,"source":"apple_notes","status":"active"}' \
+  | PYTHONPATH=src python3 -B -m nex_knowledge.consumer --db /absolute/private/knowledge.db
+```
+
+`query` is required. Optional fields are `limit`, `source`, `scope`, `from_date`, `to_date`, and `status`; they have the same validation and meaning as the search service above. Unknown or duplicate JSON keys are rejected. The default status is `active`. For example, a synthetic response is:
+
+```json
+{"protocol_version":1,"query":"garden","filters":{"limit":3,"source":"apple_notes","scope":null,"from_date":null,"to_date":null,"status":"active"},"count":1,"results":[{"document_id":"kd_<stable digest>","source":"apple_notes","source_id":"example-note","scope":"/path/to/notes.jsonl","title":"Garden","source_path":"/path/to/notes.jsonl","created_at":"2024-01-01","updated_at":"2024-03-01","status":"active","snippet":"[garden] plans","score":0.000001}]}
+```
+
+Errors have the form `{"protocol_version":1,"error":{"code":"invalid_request","message":"..."}}`; other codes include `invalid_configuration`, `database_unavailable`, and `search_error`. An older index reports that a local `sync` is needed to upgrade its schema. An empty result set is a successful response with `"count":0` and `"results":[]`.
+
+For a trusted OpenClaw integration, configure a local tool bridge to launch the adapter command above with a **fixed database path**, write a validated search JSON object to its stdin, and parse the single stdout line. For instance, the bridge may send `{"query":"garden","limit":3,"status":"active"}` and return the resulting `document_id`, provenance, snippet, and score to its caller. This is the command and payload contract, not a drop-in OpenClaw configuration. OpenClaw's [exec tool](https://docs.openclaw.ai/tools/exec/index.html) can run local commands, but it is a general shell tool; its [approval and sandbox controls](https://docs.openclaw.ai/tools/exec-approvals) remain the operator's responsibility. Grant only the specific invocation and database access appropriate for the consumer. A future dedicated OpenClaw tool can implement this same contract without changing the index or search service.
+
+The adapter itself does not read source files, ingest data, call a model, contact a network service, or offer any mutation operation. It uses the search service's read-only SQLite connection. **The trust boundary ends at stdout:** titles, snippets, timestamps, and local source paths may contain private information. A receiving application can store or forward them, including to a cloud model, so run the adapter only for consumers you trust and control access to the database with filesystem permissions. This adapter cannot make a general shell tool or another local process read-only.
+
+If the adapter reports `database_unavailable`, check the absolute path and local file permissions. If it reports `invalid_request`, verify the JSON syntax, field names, query text, and filter ranges. An older index needs an explicit local `sync` before search; a zero-result response can also mean the default active filter excluded stale records. The adapter does not start the exporter or repair a missing index.
+
+## Commit history
+
+- `d0c8c3e` — `feat(knowledge): add local source adapters and incremental FTS5 search`
+- `4a33c0d` — `feat(knowledge): track source snapshots and explicit stale reconciliation`
+- `0d3039c` — `feat(knowledge): add read-only filtered search and safe stale confirmation`

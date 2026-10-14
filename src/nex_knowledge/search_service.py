@@ -29,7 +29,7 @@ def _validate(request: SearchRequest) -> None:
         raise ValueError("query must be at most 512 characters without NUL bytes")
     if isinstance(request.limit, bool) or not isinstance(request.limit, int) or not 1 <= request.limit <= 100:
         raise ValueError("limit must be an integer between 1 and 100")
-    if request.status not in {"active", "stale", "all"}:
+    if not isinstance(request.status, str) or request.status not in {"active", "stale", "all"}:
         raise ValueError("status must be active, stale, or all")
     for name in ("source", "scope"):
         value = getattr(request, name)
