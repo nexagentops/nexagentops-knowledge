@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import uuid
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,6 +28,16 @@ class Document:
     def content_hash(self) -> str:
         payload = json.dumps([self.title, self.body, self.created_at, self.updated_at], ensure_ascii=False)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """One fully parsed import from one source path; authority is explicit."""
+
+    source: str
+    scope: str
+    records: tuple[Document, ...]
+    authoritative: bool = False
 
 
 def _text(value: object, field: str) -> str:
@@ -117,62 +128,145 @@ CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY, source TEXT NOT NULL, source_id TEXT NOT NULL,
     title TEXT NOT NULL, body TEXT NOT NULL, source_path TEXT NOT NULL,
     created_at TEXT, updated_at TEXT, content_hash TEXT NOT NULL,
-    indexed_at TEXT NOT NULL, UNIQUE(source, source_id)
+    indexed_at TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active', first_seen_at TEXT,
+    last_seen_at TEXT, last_seen_run_id TEXT, UNIQUE(source, source_id)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(
     title, body, content='documents', content_rowid='id', tokenize='unicode61 remove_diacritics 2'
 );
+CREATE TABLE IF NOT EXISTS sync_runs (
+    run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS source_snapshots (
+    run_id TEXT NOT NULL REFERENCES sync_runs(run_id), source TEXT NOT NULL,
+    scope TEXT NOT NULL, authoritative INTEGER NOT NULL, record_count INTEGER NOT NULL,
+    added INTEGER NOT NULL, updated INTEGER NOT NULL, unchanged INTEGER NOT NULL,
+    reappeared INTEGER NOT NULL, missing INTEGER NOT NULL, stale_marked INTEGER NOT NULL,
+    PRIMARY KEY (run_id, source, scope)
+);
 """
 
 
-def sync(db: Path, records: Iterable[Document], scanned_sources: Iterable[str] = ()) -> dict[str, int]:
-    records = list(records)
+def _initialize(connection: sqlite3.Connection) -> None:
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.executescript(SCHEMA)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
+    for name, definition in {
+        "scope": "TEXT NOT NULL DEFAULT ''", "status": "TEXT NOT NULL DEFAULT 'active'",
+        "first_seen_at": "TEXT", "last_seen_at": "TEXT", "last_seen_run_id": "TEXT",
+    }.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
+    connection.execute("CREATE INDEX IF NOT EXISTS documents_scope_status ON documents(source, scope, status)")
+    if "first_seen_at" not in columns:
+        connection.execute("UPDATE documents SET first_seen_at=indexed_at WHERE first_seen_at IS NULL")
+    if "last_seen_at" not in columns:
+        connection.execute("UPDATE documents SET last_seen_at=indexed_at WHERE last_seen_at IS NULL")
+    connection.commit()
+
+
+def sync_snapshots(db: Path, snapshots: Iterable[Snapshot]) -> dict[str, int | str]:
+    snapshots = list(snapshots)
+    scopes = [(snapshot.source, snapshot.scope) for snapshot in snapshots]
+    if len(scopes) != len(set(scopes)):
+        raise ValueError("duplicate source snapshot in input; index was not changed")
+    records = [record for snapshot in snapshots for record in snapshot.records]
     keys = [(record.source, record.source_id) for record in records]
     if len(keys) != len(set(keys)):
         raise ValueError("duplicate source identity in input; index was not changed")
+    if any(not snapshot.source or any(record.source != snapshot.source or not record.source_id
+                                      for record in snapshot.records) for snapshot in snapshots):
+        raise ValueError("snapshot source and record source IDs must agree")
     db.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not db.exists():
         fd = os.open(db, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
-    counts = {"added": 0, "updated": 0, "unchanged": 0, "missing_preserved": 0}
-    with closing(sqlite3.connect(db)) as connection, connection:
-        connection.executescript(SCHEMA)
-        connection.execute("BEGIN")
-        seen = set(keys)
-        touched_sources = {source for source, _ in keys} | set(scanned_sources)
-        for record in records:
-            previous = connection.execute(
-                "SELECT id, content_hash, source_path FROM documents WHERE source=? AND source_id=?",
-                (record.source, record.source_id),
-            ).fetchone()
-            if previous and previous[1] == record.content_hash and previous[2] == record.source_path:
-                counts["unchanged"] += 1
-                continue
-            timestamp = datetime.now(timezone.utc).isoformat()
-            if previous:
-                connection.execute("DELETE FROM document_fts WHERE rowid=?", (previous[0],))
+    run_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    counts: dict[str, int | str] = {"run_id": run_id, "added": 0, "updated": 0,
+                                    "unchanged": 0, "reappeared": 0, "missing": 0,
+                                    "stale_marked": 0, "missing_preserved": 0}
+    with closing(sqlite3.connect(db)) as connection:
+        _initialize(connection)
+        with connection:
+            connection.execute("INSERT INTO sync_runs(run_id, started_at) VALUES (?, ?)", (run_id, now))
+            for snapshot in snapshots:
+                local = {key: 0 for key in ("added", "updated", "unchanged", "reappeared", "missing", "stale_marked")}
+                for record in snapshot.records:
+                    previous = connection.execute(
+                        "SELECT id, content_hash, source_path, status, scope FROM documents WHERE source=? AND source_id=?",
+                        (record.source, record.source_id),
+                    ).fetchone()
+                    if previous is None:
+                        cursor = connection.execute(
+                            "INSERT INTO documents(source, source_id, title, body, source_path, created_at, updated_at, "
+                            "content_hash, indexed_at, scope, status, first_seen_at, last_seen_at, last_seen_run_id) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+                            (record.source, record.source_id, record.title, record.body, record.source_path,
+                             record.created_at, record.updated_at, record.content_hash, now, snapshot.scope,
+                             now, now, run_id),
+                        )
+                        rowid = cursor.lastrowid
+                        local["added"] += 1
+                        connection.execute("INSERT INTO document_fts(rowid, title, body) VALUES (?, ?, ?)",
+                                           (rowid, record.title, record.body))
+                        continue
+                    rowid, old_hash, old_path, old_status, old_scope = previous
+                    if old_scope != snapshot.scope and old_scope != "":
+                        raise ValueError(f"source identity moved between snapshots: {record.source}:{record.source_id}")
+                    if old_status == "stale":
+                        local["reappeared"] += 1
+                    changed = old_hash != record.content_hash or old_path != record.source_path
+                    if changed:
+                        local["updated"] += 1
+                        connection.execute("DELETE FROM document_fts WHERE rowid=?", (rowid,))
+                        connection.execute(
+                            "UPDATE documents SET title=?, body=?, source_path=?, created_at=?, updated_at=?, "
+                            "content_hash=?, indexed_at=?, scope=?, status='active', last_seen_at=?, last_seen_run_id=? WHERE id=?",
+                            (record.title, record.body, record.source_path, record.created_at, record.updated_at,
+                             record.content_hash, now, snapshot.scope, now, run_id, rowid),
+                        )
+                        connection.execute("INSERT INTO document_fts(rowid, title, body) VALUES (?, ?, ?)",
+                                           (rowid, record.title, record.body))
+                    else:
+                        local["unchanged"] += 1
+                        connection.execute(
+                            "UPDATE documents SET scope=?, status='active', last_seen_at=?, last_seen_run_id=? WHERE id=?",
+                            (snapshot.scope, now, run_id, rowid),
+                        )
+                local["missing"] = connection.execute(
+                    "SELECT COUNT(*) FROM documents WHERE source=? AND scope=? AND "
+                    "(last_seen_run_id IS NULL OR last_seen_run_id<>?)",
+                    (snapshot.source, snapshot.scope, run_id),
+                ).fetchone()[0]
+                if snapshot.authoritative:
+                    local["stale_marked"] = connection.execute(
+                        "UPDATE documents SET status='stale' WHERE source=? AND scope=? AND status='active' "
+                        "AND (last_seen_run_id IS NULL OR last_seen_run_id<>?)",
+                        (snapshot.source, snapshot.scope, run_id),
+                    ).rowcount
+                else:
+                    counts["missing_preserved"] += local["missing"]
                 connection.execute(
-                    "UPDATE documents SET title=?, body=?, source_path=?, created_at=?, updated_at=?, content_hash=?, indexed_at=? WHERE id=?",
-                    (record.title, record.body, record.source_path, record.created_at, record.updated_at,
-                     record.content_hash, timestamp, previous[0]),
+                    "INSERT INTO source_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (run_id, snapshot.source, snapshot.scope, int(snapshot.authoritative),
+                     len(snapshot.records), *(local[key] for key in
+                                              ("added", "updated", "unchanged", "reappeared", "missing", "stale_marked"))),
                 )
-                rowid = previous[0]
-                counts["updated"] += 1
-            else:
-                cursor = connection.execute(
-                    "INSERT INTO documents(source, source_id, title, body, source_path, created_at, updated_at, content_hash, indexed_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (record.source, record.source_id, record.title, record.body, record.source_path,
-                     record.created_at, record.updated_at, record.content_hash, timestamp),
-                )
-                rowid = cursor.lastrowid
-                counts["added"] += 1
-            connection.execute("INSERT INTO document_fts(rowid, title, body) VALUES (?, ?, ?)",
-                               (rowid, record.title, record.body))
-        for source, source_id in connection.execute("SELECT source, source_id FROM documents"):
-            if source in touched_sources and (source, source_id) not in seen:
-                counts["missing_preserved"] += 1
+                for key, value in local.items():
+                    counts[key] += value
+            connection.execute("UPDATE sync_runs SET finished_at=? WHERE run_id=?",
+                               (datetime.now(timezone.utc).isoformat(), run_id))
     return counts
+
+
+def sync(db: Path, records: Iterable[Document], scanned_sources: Iterable[str] = ()) -> dict[str, int | str]:
+    """Compatibility entry point: all imports are non-authoritative."""
+    records = list(records)
+    sources = {record.source for record in records} | set(scanned_sources)
+    return sync_snapshots(db, [Snapshot(source, "", tuple(record for record in records if record.source == source))
+                               for source in sorted(sources)])
 
 
 def search(db: Path, query: str, limit: int = 20) -> list[dict[str, str | None]]:
@@ -184,9 +278,25 @@ def search(db: Path, query: str, limit: int = 20) -> list[dict[str, str | None]]
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             "SELECT d.source, d.source_id, d.title, d.source_path, d.created_at, d.updated_at, "
+            "d.status, d.first_seen_at, d.last_seen_at, d.last_seen_run_id, "
             "snippet(document_fts, 1, '[', ']', '…', 18) AS snippet "
             "FROM document_fts JOIN documents d ON d.id=document_fts.rowid "
             "WHERE document_fts MATCH ? ORDER BY bm25(document_fts), d.source, d.source_id LIMIT ?",
             (query, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def recent_snapshots(db: Path, limit: int = 20) -> list[dict[str, str | int]]:
+    """Inspect committed import decisions without exposing indexed content."""
+    if not db.is_file():
+        raise ValueError(f"index does not exist: {db}")
+    if not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    with closing(sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT s.*, r.finished_at FROM source_snapshots s JOIN sync_runs r ON r.run_id=s.run_id "
+            "ORDER BY r.finished_at DESC, s.run_id DESC, s.source, s.scope LIMIT ?", (limit,)
         ).fetchall()
         return [dict(row) for row in rows]

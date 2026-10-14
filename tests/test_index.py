@@ -1,10 +1,14 @@
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 from nex_knowledge.cli import main
-from nex_knowledge.index import Document, conversations, markdown, notes, search, sync
+from nex_knowledge.index import Document, Snapshot, conversations, markdown, notes, recent_snapshots, search, sync, sync_snapshots
 
 
 class IndexTests(unittest.TestCase):
@@ -35,8 +39,9 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(next(row for row in found if row["source"] == "chatgpt_archive")["source_id"], "cc_123")
         self.assertEqual(next(row for row in found if row["source"] == "apple_notes")["updated_at"], "2024-02-01")
         revised = [Document("apple_notes", "n1", "Garden", "lily notes", str(note_path))]
-        self.assertEqual(sync(self.db, revised), {"added": 0, "updated": 1, "unchanged": 0,
-                                                   "missing_preserved": 0})
+        changed = sync(self.db, revised)
+        self.assertEqual([changed[key] for key in ("added", "updated", "unchanged", "missing_preserved")],
+                         [0, 1, 0, 0])
         self.assertEqual(len(search(self.db, "orchid")), 2)
         self.assertEqual(len(search(self.db, "lily")), 1)
         self.assertEqual(self.db.stat().st_mode & 0o777, 0o600)
@@ -76,6 +81,117 @@ class IndexTests(unittest.TestCase):
                   "--markdown-dir", str(generated)])
         self.assertEqual(raised.exception.code, 2)
         self.assertFalse(self.db.exists())
+
+    def test_authority_stale_and_reappearance(self):
+        first = Document("apple_notes", "n1", "Plan", "violet", "notes.jsonl", "2024-01-01")
+        second = Document("apple_notes", "n2", "Todo", "rose", "notes.jsonl")
+        snapshot = lambda records, authoritative=False: Snapshot(
+            "apple_notes", "notes.jsonl", tuple(records), authoritative)
+        added = sync_snapshots(self.db, [snapshot([first, second], True)])
+        self.assertEqual(added["added"], 2)
+        self.assertEqual(added["stale_marked"], 0)
+        unchanged = sync_snapshots(self.db, [snapshot([first, second], True)])
+        self.assertEqual(unchanged["unchanged"], 2)
+        modified = Document("apple_notes", "n1", "Plan", "violet and iris", "notes.jsonl", "2024-01-01")
+        partial = sync_snapshots(self.db, [snapshot([modified])])
+        self.assertEqual(partial["updated"], 1)
+        self.assertEqual(partial["missing"], 1)
+        self.assertEqual(partial["stale_marked"], 0)
+        self.assertEqual(next(row for row in search(self.db, "rose"))["status"], "active")
+        authoritative = sync_snapshots(self.db, [snapshot([modified], True)])
+        self.assertEqual(authoritative["missing"], 1)
+        self.assertEqual(authoritative["stale_marked"], 1)
+        self.assertEqual(next(row for row in search(self.db, "rose"))["status"], "stale")
+        repeated = sync_snapshots(self.db, [snapshot([modified], True)])
+        self.assertEqual(repeated["missing"], 1)
+        self.assertEqual(repeated["stale_marked"], 0)
+        reappeared = sync_snapshots(self.db, [snapshot([modified, second])])
+        self.assertEqual(reappeared["reappeared"], 1)
+        self.assertEqual(reappeared["unchanged"], 2)
+        self.assertEqual(next(row for row in search(self.db, "rose"))["status"], "active")
+        history = recent_snapshots(self.db)
+        self.assertEqual(history[0]["run_id"], reappeared["run_id"])
+        self.assertEqual(history[0]["authoritative"], 0)
+        self.assertEqual(history[0]["reappeared"], 1)
+        with closing(sqlite3.connect(self.db)) as connection:
+            seen = connection.execute("SELECT first_seen_at, last_seen_at, last_seen_run_id "
+                                      "FROM documents WHERE source_id='n2'").fetchone()
+            self.assertLessEqual(seen[0], seen[1])
+            self.assertEqual(seen[2], reappeared["run_id"])
+
+    def test_same_content_from_different_sources_stays_separate(self):
+        one = Document("apple_notes", "shared", "Same", "identical body", "notes.jsonl")
+        two = Document("markdown", "shared", "Same", "identical body", "same.md")
+        counts = sync_snapshots(self.db, [Snapshot("apple_notes", "notes.jsonl", (one,), True),
+                                          Snapshot("markdown", "docs", (two,), True)])
+        self.assertEqual(counts["added"], 2)
+        self.assertEqual({row["source"] for row in search(self.db, "identical")},
+                         {"apple_notes", "markdown"})
+
+    def test_scopes_do_not_stale_each_other(self):
+        first = Document("markdown", "a", "A", "alpha", "one/a.md")
+        second = Document("markdown", "b", "B", "beta", "two/b.md")
+        sync_snapshots(self.db, [Snapshot("markdown", "one", (first,), True),
+                                 Snapshot("markdown", "two", (second,), True)])
+        result = sync_snapshots(self.db, [Snapshot("markdown", "one", (), True)])
+        self.assertEqual(result["stale_marked"], 1)
+        self.assertEqual(next(row for row in search(self.db, "beta"))["status"], "active")
+
+    def test_duplicate_id_across_snapshots_is_rejected_before_writes(self):
+        record = Document("markdown", "same", "Title", "body", "a.md")
+        with self.assertRaisesRegex(ValueError, "duplicate source identity"):
+            sync_snapshots(self.db, [Snapshot("markdown", "one", (record,)),
+                                     Snapshot("markdown", "two", (record,))])
+        self.assertFalse(self.db.exists())
+
+    def test_scope_collision_rolls_back_whole_run(self):
+        original = Document("markdown", "a", "Original", "oldword", "one/a.md")
+        sync_snapshots(self.db, [Snapshot("markdown", "one", (original,))])
+        other = Document("apple_notes", "n1", "New", "newword", "notes.jsonl")
+        with self.assertRaisesRegex(ValueError, "moved between snapshots"):
+            sync_snapshots(self.db, [Snapshot("apple_notes", "notes.jsonl", (other,)),
+                                     Snapshot("markdown", "two", (original,))])
+        self.assertEqual(search(self.db, "newword"), [])
+        self.assertEqual(len(recent_snapshots(self.db)), 1)
+
+    def test_existing_index_migrates_without_losing_search(self):
+        self.db.parent.mkdir()
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.executescript("""
+                CREATE TABLE documents (id INTEGER PRIMARY KEY, source TEXT NOT NULL, source_id TEXT NOT NULL,
+                    title TEXT NOT NULL, body TEXT NOT NULL, source_path TEXT NOT NULL,
+                    created_at TEXT, updated_at TEXT, content_hash TEXT NOT NULL, indexed_at TEXT NOT NULL,
+                    UNIQUE(source, source_id));
+                CREATE VIRTUAL TABLE document_fts USING fts5(title, body, content='documents', content_rowid='id');
+                INSERT INTO documents VALUES (1, 'apple_notes', 'old', 'Old', 'legacyword', 'old.jsonl',
+                    NULL, NULL, 'hash', '2024-01-01');
+                INSERT INTO document_fts(rowid, title, body) VALUES (1, 'Old', 'legacyword');
+            """)
+        sync_snapshots(self.db, [Snapshot("apple_notes", "new.jsonl", (), True)])
+        self.assertEqual(next(row for row in search(self.db, "legacyword"))["status"], "active")
+        with closing(sqlite3.connect(self.db)) as connection:
+            row = connection.execute("SELECT scope, first_seen_at FROM documents WHERE source_id='old'").fetchone()
+            self.assertEqual(row, ("", "2024-01-01"))
+
+    def test_cli_authoritative_snapshot_and_history(self):
+        path = self.root / "notes.jsonl"
+        path.write_text(json.dumps({"id": "n1", "title": "Plan", "body_text": "lavender"}) + "\n")
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(main(["sync", "--db", str(self.db),
+                                   "--authoritative-notes-jsonl", str(path)]), 0)
+        self.assertEqual(json.loads(output.getvalue())["added"], 1)
+        path.write_text("")
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(main(["sync", "--db", str(self.db),
+                                   "--authoritative-notes-jsonl", str(path)]), 0)
+        self.assertEqual(json.loads(output.getvalue())["stale_marked"], 1)
+        self.assertEqual(next(row for row in search(self.db, "lavender"))["status"], "stale")
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(main(["snapshots", "--db", str(self.db)]), 0)
+        self.assertEqual(json.loads(output.getvalue())[0]["missing"], 1)
 
 
 if __name__ == "__main__":
